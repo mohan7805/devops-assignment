@@ -1,0 +1,32 @@
+# Node
+node_modules/
+coverage/
+npm-debug.log*
+*.tsbuildinfo
+
+# Terraform
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+crash.log
+tfplan
+*.tfplan
+override.tf
+override.tf.json
+.terraformrc
+terraform.rc
+
+# Never commit real variable values or secrets
+terraform.tfvars
+*.auto.tfvars
+.env
+.env.*
+!.env.example
+
+# Local
+.DS_Store
+.idea/
+.vscode/
+/tmp/
+zero-downtime.log
