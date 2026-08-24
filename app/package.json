@@ -1,0 +1,39 @@
+{
+  "name": "devops-assignment-api",
+  "version": "1.0.0",
+  "description": "Small REST API exposing /health and /info, deployed to AWS via Terraform + GitHub Actions",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20.0.0 <25"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "jest --coverage --runInBand",
+    "test:ci": "jest --coverage --runInBand --ci"
+  },
+  "dependencies": {
+    "express": "4.22.2"
+  },
+  "devDependencies": {
+    "jest": "29.7.0",
+    "supertest": "7.1.1"
+  },
+  "overrides": {
+    "path-to-regexp": "0.1.13"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "src/**/*.js",
+      "!src/server.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "lines": 70,
+        "statements": 70
+      }
+    }
+  },
+  "license": "MIT"
+}
