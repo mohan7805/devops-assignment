@@ -1,0 +1,163 @@
+#!/bin/bash
+###############################################################################
+# Bootstrap for the application instances (Amazon Linux 2023).
+#
+# Rendered by Terraform (templatefile) into the launch template's user-data.
+#
+#   1. install Docker + the CloudWatch agent + the AWS CLI
+#   2. read the image tag and the secret greeting from SSM Parameter Store
+#   3. log in to ECR and run the container as a systemd-managed unit
+#
+# Nothing secret is baked into this file: it only contains *names* of SSM
+# parameters, which are resolved at boot using the instance role.
+###############################################################################
+set -euo pipefail
+
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+echo "[user-data] starting at $(date -Is)"
+
+AWS_REGION="${aws_region}"
+ECR_REPOSITORY_URL="${ecr_repository_url}"
+IMAGE_TAG_PARAMETER="${image_tag_parameter}"
+GREETING_PARAMETER="${greeting_parameter}"
+APP_PORT="${app_port}"
+APP_VERSION="${app_version}"
+LOG_GROUP="${log_group}"
+APP_ENV="${environment}"
+CONTAINER_NAME="app"
+
+export AWS_DEFAULT_REGION="$${AWS_REGION}"
+
+###############################################################################
+# 1. Packages
+###############################################################################
+dnf -y update --security || true
+dnf -y install docker amazon-cloudwatch-agent jq
+
+# The SSM Agent ships preinstalled on AL2023; make sure it is running so that
+# Session Manager works (this is the only administrative access path).
+systemctl enable --now amazon-ssm-agent
+systemctl enable --now docker
+
+###############################################################################
+# 2. CloudWatch agent - system logs with a defined retention (set in Terraform)
+###############################################################################
+INSTANCE_ID="$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')" http://169.254.169.254/latest/meta-data/instance-id)"
+
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWAGENT
+{
+  "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/messages",
+            "log_group_name": "$${LOG_GROUP}",
+            "log_stream_name": "$${INSTANCE_ID}/system",
+            "timezone": "UTC"
+          },
+          {
+            "file_path": "/var/log/user-data.log",
+            "log_group_name": "$${LOG_GROUP}",
+            "log_stream_name": "$${INSTANCE_ID}/user-data",
+            "timezone": "UTC"
+          }
+        ]
+      }
+    }
+  },
+  "metrics": {
+    "namespace": "CWAgent",
+    "append_dimensions": { "InstanceId": "\$${aws:InstanceId}" },
+    "metrics_collected": {
+      "mem": { "measurement": ["mem_used_percent"] },
+      "disk": { "measurement": ["used_percent"], "resources": ["/"] }
+    }
+  }
+}
+CWAGENT
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+###############################################################################
+# 3. Runtime configuration from SSM Parameter Store
+#
+# The image tag is a plain String parameter that the CI pipeline updates before
+# starting an instance refresh. The greeting is a SecureString - it is decrypted
+# here at runtime and never stored in git or in the launch template.
+###############################################################################
+IMAGE_TAG="$(aws ssm get-parameter --name "$${IMAGE_TAG_PARAMETER}" --query 'Parameter.Value' --output text)"
+GREETING="$(aws ssm get-parameter --name "$${GREETING_PARAMETER}" --with-decryption --query 'Parameter.Value' --output text)"
+
+echo "[user-data] deploying image tag: $${IMAGE_TAG}"
+
+# Write the secret to a root-only env file rather than the process table.
+install -m 0600 /dev/null /etc/app.env
+cat > /etc/app.env <<ENVFILE
+PORT=$${APP_PORT}
+APP_VERSION=$${APP_VERSION}
+GIT_COMMIT_SHA=$${IMAGE_TAG}
+GREETING=$${GREETING}
+APP_ENV=$${APP_ENV}
+ENABLE_CHAOS=true
+SHUTDOWN_TIMEOUT_MS=15000
+NODE_ENV=production
+ENVFILE
+
+###############################################################################
+# 4. Pull the image and run it under systemd
+###############################################################################
+ECR_REGISTRY="$${ECR_REPOSITORY_URL%%/*}"
+aws ecr get-login-password --region "$${AWS_REGION}" \
+  | docker login --username AWS --password-stdin "$${ECR_REGISTRY}"
+
+docker pull "$${ECR_REPOSITORY_URL}:$${IMAGE_TAG}"
+
+cat > /etc/systemd/system/app.service <<UNIT
+[Unit]
+Description=DevOps assignment API container
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Restart=always
+RestartSec=5
+TimeoutStartSec=300
+# Stop must outlast the app's graceful shutdown so draining completes cleanly.
+TimeoutStopSec=45
+ExecStartPre=-/usr/bin/docker rm -f $${CONTAINER_NAME}
+ExecStart=/usr/bin/docker run --rm --name $${CONTAINER_NAME} \\
+  --env-file /etc/app.env \\
+  -p $${APP_PORT}:$${APP_PORT} \\
+  --read-only --cap-drop ALL --security-opt no-new-privileges \\
+  --log-driver awslogs \\
+  --log-opt awslogs-region=$${AWS_REGION} \\
+  --log-opt awslogs-group=$${LOG_GROUP} \\
+  --log-opt awslogs-stream=$${INSTANCE_ID}/app \\
+  $${ECR_REPOSITORY_URL}:$${IMAGE_TAG}
+ExecStop=/usr/bin/docker stop --time 30 $${CONTAINER_NAME}
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now app.service
+
+###############################################################################
+# 5. Do not report success until the app answers its own health check, so the
+#    ASG/ALB only receive traffic once the instance is genuinely ready.
+###############################################################################
+for attempt in $(seq 1 60); do
+  if curl -fsS "http://127.0.0.1:$${APP_PORT}/health" >/dev/null; then
+    echo "[user-data] application healthy after $${attempt} attempt(s)"
+    exit 0
+  fi
+  sleep 5
+done
+
+echo "[user-data] ERROR: application did not become healthy in time" >&2
+exit 1
