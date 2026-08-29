@@ -1,0 +1,154 @@
+name: Terraform
+
+# Infrastructure pipeline: validate + plan on pull requests, apply on main.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  TF_VERSION: '1.9.8'
+  WORKDIR: terraform/envs/prod
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  validate:
+    name: Format, validate and scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive terraform/
+
+      # Validation without a backend, so it runs on forks with no credentials.
+      - name: terraform validate
+        run: |
+          set -euo pipefail
+          for dir in terraform/envs/prod terraform/bootstrap; do
+            echo "::group::validate ${dir}"
+            terraform -chdir="${dir}" init -backend=false -input=false
+            terraform -chdir="${dir}" validate
+            echo "::endgroup::"
+          done
+
+      # Static analysis of the IaC itself. Fails on HIGH/CRITICAL misconfigs.
+      - name: Trivy IaC scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: terraform/
+          severity: 'HIGH,CRITICAL'
+          exit-code: '1'
+          # Each suppression in this file carries a written justification.
+          trivyignores: .trivyignore
+
+  plan:
+    name: Plan
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # All credentials and backend coordinates come from GitHub Secrets.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: terraform init (S3 backend + DynamoDB lock)
+        run: |
+          terraform -chdir="${WORKDIR}" init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=prod/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+
+      - name: terraform plan
+        run: |
+          terraform -chdir="${WORKDIR}" plan -input=false -lock-timeout=5m -out=tfplan \
+            -var="owner=${{ vars.OWNER || 'platform-team' }}" \
+            -var="alarm_email=${{ secrets.ALARM_EMAIL }}" \
+            -var="aws_region=${AWS_REGION}"
+
+      - name: Render the plan
+        run: terraform -chdir="${WORKDIR}" show -no-color tfplan | tee /tmp/plan.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: |
+            ${{ env.WORKDIR }}/tfplan
+            /tmp/plan.txt
+          retention-days: 7
+
+  apply:
+    name: Apply
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    environment:
+      name: production-infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: terraform init
+        run: |
+          terraform -chdir="${WORKDIR}" init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=prod/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+
+      - name: terraform apply
+        run: |
+          terraform -chdir="${WORKDIR}" apply -input=false -auto-approve -lock-timeout=5m \
+            -var="owner=${{ vars.OWNER || 'platform-team' }}" \
+            -var="alarm_email=${{ secrets.ALARM_EMAIL }}" \
+            -var="aws_region=${AWS_REGION}"
+
+      - name: Publish the stack outputs
+        run: |
+          {
+            echo "### Infrastructure outputs"
+            echo ""
+            echo '```'
+            terraform -chdir="${WORKDIR}" output
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

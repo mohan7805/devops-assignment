@@ -1,0 +1,34 @@
+# Trivy misconfiguration suppressions.
+#
+# Every entry here is a deliberate architectural decision, not an oversight.
+# Findings that were genuine defects were FIXED rather than listed here:
+#   * AVD-AWS-0164 - public subnets no longer auto-assign public IPs
+#   * AVD-AWS-0095 - the SNS alarm topic is encrypted with a customer-managed
+#                    KMS key whose policy lets CloudWatch publish to it
+
+# AVD-AWS-0053: "Load balancer is exposed to the internet."
+# The application is intentionally public - that is the assignment. The ALB is
+# the only internet-facing component; the instances sit in private subnets.
+AVD-AWS-0053
+
+# AVD-AWS-0054: "Use of plain HTTP."
+# No domain name or ACM certificate is in scope for this assignment, so the
+# listener is HTTP/80. Production would add an HTTPS listener plus a redirect;
+# the ALB module already accepts the change in a single block.
+AVD-AWS-0054
+
+# AVD-AWS-0104: "Security group rule allows unrestricted egress."
+# The application instances must reach ECR, SSM, CloudWatch Logs and the
+# Amazon Linux package mirrors, whose IP ranges are not stable. Egress is
+# already restricted to ports 80 and 443, and all of it leaves through the NAT
+# Gateway - there is no inbound path. The interface VPC endpoints defined in
+# the security module are the route to tightening this further.
+AVD-AWS-0104
+
+# AVD-AWS-0132: "S3 encryption should use Customer Managed Keys."
+# The Terraform state bucket uses SSE-S3 (AES256), which satisfies the
+# "encryption enabled" requirement. A CMK would add key administration and
+# cross-account policy overhead that this single-account assignment does not
+# warrant. Bucket versioning, a TLS-only bucket policy and a full public
+# access block are all in place.
+AVD-AWS-0132
