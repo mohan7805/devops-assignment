@@ -1,0 +1,397 @@
+name: CI/CD
+
+# Runs automatically on every push to main. Pull requests get everything except
+# the push/deploy stages.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_zero_downtime_check:
+        description: 'Skip the zero-downtime curl loop'
+        type: boolean
+        default: false
+
+concurrency:
+  # Never let two deployments race for the same Auto Scaling Group.
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  PROJECT: ${{ vars.PROJECT || 'devops-assignment' }}
+  ENVIRONMENT: ${{ vars.ENVIRONMENT || 'prod' }}
+  APP_VERSION: ${{ vars.APP_VERSION || '1.0.0' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # 1. TEST - fails the build if any unit test fails.
+  # ===========================================================================
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.20.0'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      # `npm test` exits non-zero on the first failing assertion, which fails
+      # this job and therefore the whole workflow.
+      - name: Run unit tests
+        run: npm run test:ci
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: app/coverage/
+          retention-days: 7
+
+  # ===========================================================================
+  # 2/3/4. BUILD -> SCAN (Trivy) -> PUSH
+  # ===========================================================================
+  build:
+    name: Build, scan and push
+    needs: test
+    runs-on: ubuntu-24.04
+    outputs:
+      image_tag: ${{ steps.meta.outputs.short_sha }}
+      image_uri: ${{ steps.push.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "Building image tag: ${SHORT_SHA}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Images are tagged with the short git SHA. `latest` is never used, so a
+      # running instance can always be traced back to an exact commit.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: ${{ env.PROJECT }}:${{ steps.meta.outputs.short_sha }}
+          build-args: |
+            APP_VERSION=${{ env.APP_VERSION }}
+            GIT_COMMIT_SHA=${{ steps.meta.outputs.short_sha }}
+            BUILD_DATE=${{ steps.meta.outputs.build_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Fail-the-build gate: exit-code 1 on any HIGH or CRITICAL finding.
+      # The results are also uploaded, but the gate is what stops the pipeline.
+      - name: Scan image with Trivy (fails on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.PROJECT }}:${{ steps.meta.outputs.short_sha }}
+          format: table
+          severity: 'HIGH,CRITICAL'
+          ignore-unfixed: false
+          vuln-type: 'os,library'
+          exit-code: '1'
+        env:
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
+
+      - name: Trivy SARIF report
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.PROJECT }}:${{ steps.meta.outputs.short_sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0'
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: trivy-results.sarif
+          retention-days: 30
+
+      # Credentials come from GitHub Secrets. GitHub masks secret values in the
+      # logs automatically; the account ID is masked explicitly below.
+      - name: Configure AWS credentials
+        if: github.ref == 'refs/heads/main'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Log in to Amazon ECR
+        if: github.ref == 'refs/heads/main'
+        id: ecr
+        run: |
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          echo "::add-mask::${ACCOUNT_ID}"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          echo "::add-mask::${REGISTRY}"
+          aws ecr get-login-password --region "${AWS_REGION}" \
+            | docker login --username AWS --password-stdin "${REGISTRY}"
+          echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+
+      # A failing push fails the job - there is no `continue-on-error` here.
+      - name: Push image to ECR
+        if: github.ref == 'refs/heads/main'
+        id: push
+        run: |
+          set -euo pipefail
+          IMAGE_URI="${{ steps.ecr.outputs.registry }}/${PROJECT}:${{ steps.meta.outputs.short_sha }}"
+          docker tag "${PROJECT}:${{ steps.meta.outputs.short_sha }}" "${IMAGE_URI}"
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "Pushed image tagged ${{ steps.meta.outputs.short_sha }}"
+
+  # ===========================================================================
+  # 5. DEPLOY - rolling instance refresh, gated on ALB target health.
+  # ===========================================================================
+  deploy:
+    name: Deploy (rolling, zero downtime)
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment:
+      name: production
+      url: ${{ steps.discover.outputs.app_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      # Terraform publishes these three values to SSM Parameter Store, so the
+      # pipeline never guesses a resource name or hardcodes an ARN.
+      - name: Discover infrastructure
+        id: discover
+        run: |
+          set -euo pipefail
+
+          read_param() {
+            aws ssm get-parameter --name "/${PROJECT}/${ENVIRONMENT}/$1" \
+              --query 'Parameter.Value' --output text 2>/dev/null || echo ""
+          }
+
+          ASG_NAME="$(read_param asg_name)"
+          TG_ARN="$(read_param target_group_arn)"
+          ALB_DNS="$(read_param alb_dns_name)"
+
+          if [[ -z "${ASG_NAME}" || -z "${TG_ARN}" || -z "${ALB_DNS}" ]]; then
+            echo "::error::Discovery parameters are missing under /${PROJECT}/${ENVIRONMENT}/. Has the Terraform stack been applied?"
+            exit 1
+          fi
+
+          echo "asg_name=${ASG_NAME}"   >> "$GITHUB_OUTPUT"
+          echo "tg_arn=${TG_ARN}"       >> "$GITHUB_OUTPUT"
+          echo "app_url=http://${ALB_DNS}" >> "$GITHUB_OUTPUT"
+
+          echo "ASG:    ${ASG_NAME}"
+          echo "URL:    http://${ALB_DNS}"
+
+      - name: Record the currently deployed version
+        id: before
+        run: |
+          BEFORE="$(curl -fsS --max-time 10 "${{ steps.discover.outputs.app_url }}/info" || echo '{}')"
+          echo "Current /info: ${BEFORE}"
+          echo "commit=$(echo "${BEFORE}" | jq -r '.commit // "none"')" >> "$GITHUB_OUTPUT"
+
+      # Continuous probe that proves the release caused no failed requests.
+      - name: Start zero-downtime probe
+        if: ${{ inputs.skip_zero_downtime_check != true }}
+        run: |
+          nohup ./scripts/zero-downtime-check.sh \
+            "${{ steps.discover.outputs.app_url }}" \
+            /tmp/zero-downtime.log > /tmp/probe-stdout.log 2>&1 &
+          echo $! > /tmp/probe.pid
+          sleep 3
+
+      # The new tag is published to SSM; instances read it on boot.
+      - name: Publish the new image tag to SSM Parameter Store
+        run: |
+          aws ssm put-parameter \
+            --name "/${PROJECT}/${ENVIRONMENT}/image_tag" \
+            --value "${{ needs.build.outputs.image_tag }}" \
+            --type String --overwrite \
+            --description "Set by GitHub Actions run ${{ github.run_id }}"
+          echo "SSM image_tag = ${{ needs.build.outputs.image_tag }}"
+
+      # Rolling refresh: min 100% healthy, max 200% => a new instance is in
+      # service before an old one is removed. Never fewer than 2 healthy targets.
+      - name: Start instance refresh
+        id: refresh
+        run: |
+          set -euo pipefail
+          REFRESH_ID="$(aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ steps.discover.outputs.asg_name }}" \
+            --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":120,"ScaleInProtectedInstances":"Ignore"}' \
+            --query 'InstanceRefreshId' --output text)"
+          echo "refresh_id=${REFRESH_ID}" >> "$GITHUB_OUTPUT"
+          echo "Instance refresh ${REFRESH_ID} started"
+
+      - name: Wait for the instance refresh to complete
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          ASG="${{ steps.discover.outputs.asg_name }}"
+          ID="${{ steps.refresh.outputs.refresh_id }}"
+
+          while true; do
+            STATUS="$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "${ASG}" --instance-refresh-ids "${ID}" \
+              --query 'InstanceRefreshes[0].Status' --output text)"
+            PCT="$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "${ASG}" --instance-refresh-ids "${ID}" \
+              --query 'InstanceRefreshes[0].PercentageComplete' --output text)"
+
+            echo "refresh status=${STATUS} complete=${PCT}%"
+
+            case "${STATUS}" in
+              Successful) echo "Instance refresh completed."; break ;;
+              Failed|Cancelled|RollbackSuccessful|RollbackFailed)
+                REASON="$(aws autoscaling describe-instance-refreshes \
+                  --auto-scaling-group-name "${ASG}" --instance-refresh-ids "${ID}" \
+                  --query 'InstanceRefreshes[0].StatusReason' --output text)"
+                echo "::error::Instance refresh ended with status ${STATUS}: ${REASON}"
+                exit 1 ;;
+            esac
+            sleep 20
+          done
+
+      # Deployment gate: every registered target must be 'healthy' in the ALB
+      # target group, otherwise the job - and the build - fails.
+      - name: Verify ALB target group health
+        run: |
+          set -euo pipefail
+          TG="${{ steps.discover.outputs.tg_arn }}"
+
+          for attempt in $(seq 1 40); do
+            STATES="$(aws elbv2 describe-target-health --target-group-arn "${TG}" \
+              --query 'TargetHealthDescriptions[].TargetHealth.State' --output text)"
+            HEALTHY="$(echo "${STATES}" | tr '\t' '\n' | grep -c '^healthy$' || true)"
+            TOTAL="$(echo "${STATES}" | tr '\t' '\n' | grep -c . || true)"
+            echo "attempt ${attempt}: ${HEALTHY}/${TOTAL} targets healthy (${STATES})"
+
+            if [[ "${TOTAL}" -ge 2 && "${HEALTHY}" -eq "${TOTAL}" ]]; then
+              echo "All ${TOTAL} targets are healthy."
+              exit 0
+            fi
+            sleep 15
+          done
+
+          echo "::error::The new version never became healthy in the ALB target group."
+          exit 1
+
+      # Confirms the deployed commit actually changed to the one just built.
+      - name: Verify the running version
+        run: |
+          set -euo pipefail
+          EXPECTED="${{ needs.build.outputs.image_tag }}"
+
+          for attempt in $(seq 1 20); do
+            ACTUAL="$(curl -fsS --max-time 10 "${{ steps.discover.outputs.app_url }}/info" | jq -r '.commit')"
+            echo "attempt ${attempt}: /info reports commit=${ACTUAL} (expected ${EXPECTED})"
+            [[ "${ACTUAL}" == "${EXPECTED}" ]] && { echo "Version verified."; exit 0; }
+            sleep 10
+          done
+
+          echo "::error::/info still does not report the new commit ${EXPECTED}."
+          exit 1
+
+      - name: Stop the probe and assert zero failed requests
+        if: ${{ always() && inputs.skip_zero_downtime_check != true }}
+        run: |
+          if [[ -f /tmp/probe.pid ]]; then
+            kill "$(cat /tmp/probe.pid)" 2>/dev/null || true
+            sleep 2
+          fi
+
+          echo "----- zero-downtime probe -----"
+          tail -n 30 /tmp/zero-downtime.log || true
+
+          FAILED="$(grep -c '^FAIL' /tmp/zero-downtime.log || true)"
+          TOTAL="$(grep -cE '^(OK|FAIL)' /tmp/zero-downtime.log || true)"
+          VERSIONS="$(grep '^OK' /tmp/zero-downtime.log | awk '{print $4}' | sort -u | tr '\n' ' ')"
+
+          echo "### Zero-downtime result" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Requests during release | ${TOTAL} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Failed requests | ${FAILED} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commits observed in /info | ${VERSIONS} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Before | ${{ steps.before.outputs.commit }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| After | ${{ needs.build.outputs.image_tag }} |" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "${FAILED}" -ne 0 ]]; then
+            echo "::error::${FAILED} request(s) failed during the release - the deployment was not zero-downtime."
+            exit 1
+          fi
+          echo "Zero downtime confirmed: ${TOTAL} requests, 0 failures."
+
+      - name: Upload the zero-downtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zero-downtime-log
+          path: /tmp/zero-downtime.log
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ===========================================================================
+  # 6. ROLLBACK - only if the deploy job failed.
+  # ===========================================================================
+  rollback:
+    name: Roll back
+    needs: [build, deploy]
+    if: failure() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Cancel any in-flight instance refresh
+        continue-on-error: true
+        run: |
+          ASG="$(aws ssm get-parameter --name "/${PROJECT}/${ENVIRONMENT}/asg_name" \
+            --query 'Parameter.Value' --output text)"
+          aws autoscaling cancel-instance-refresh --auto-scaling-group-name "${ASG}" || true
+          echo "::warning::Deployment failed. The previous instances were kept in service (min healthy 100%)."
