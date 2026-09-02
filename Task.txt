@@ -1,0 +1,4 @@
+stop the auto worflow  run when push main in github action,
+add the secret key for all services
+run the CICD worlflow
+run the terraform

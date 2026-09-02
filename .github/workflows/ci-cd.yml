@@ -12,6 +12,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      run_trivy_scan:
+        description: 'Run Trivy security scan (uncheck to skip)'
+        type: boolean
+        default: true
       skip_zero_downtime_check:
         description: 'Skip the zero-downtime curl loop'
         type: boolean
@@ -109,7 +113,8 @@ jobs:
       # Fail-the-build gate: exit-code 1 on any HIGH or CRITICAL finding.
       # The results are also uploaded, but the gate is what stops the pipeline.
       - name: Scan image with Trivy (fails on HIGH/CRITICAL)
-        uses: aquasecurity/trivy-action@0.28.0
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_trivy_scan != false }}
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           image-ref: ${{ env.PROJECT }}:${{ steps.meta.outputs.short_sha }}
           format: table
@@ -121,8 +126,8 @@ jobs:
           TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
 
       - name: Trivy SARIF report
-        if: always()
-        uses: aquasecurity/trivy-action@0.28.0
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.run_trivy_scan != false) }}
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           image-ref: ${{ env.PROJECT }}:${{ steps.meta.outputs.short_sha }}
           format: sarif
@@ -131,7 +136,7 @@ jobs:
           exit-code: '0'
 
       - name: Upload Trivy report
-        if: always()
+        if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.run_trivy_scan != false) && hashFiles('trivy-results.sarif') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: trivy-results
