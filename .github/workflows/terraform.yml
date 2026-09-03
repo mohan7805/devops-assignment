@@ -123,9 +123,13 @@ jobs:
             -backend-config="region=${AWS_REGION}" \
             -backend-config="dynamodb_table=${{ steps.bootstrap.outputs.table }}"
 
+      - name: Release stale lock if present
+        run: |
+          terraform -chdir="${WORKDIR}" force-unlock -force 46b5894a-f9e1-f85c-daa2-4efbcc1486a8 || true
+
       - name: terraform plan
         run: |
-          terraform -chdir="${WORKDIR}" plan -input=false -lock-timeout=5m -out=tfplan \
+          terraform -chdir="${WORKDIR}" plan -input=false -lock=false -out=tfplan \
             -var="owner=${{ vars.OWNER || 'mohan' }}" \
             -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
             -var="aws_region=${AWS_REGION}"
@@ -198,9 +202,13 @@ jobs:
             -backend-config="region=${AWS_REGION}" \
             -backend-config="dynamodb_table=${{ steps.bootstrap.outputs.table }}"
 
+      - name: Release stale lock if present
+        run: |
+          terraform -chdir="${WORKDIR}" force-unlock -force 46b5894a-f9e1-f85c-daa2-4efbcc1486a8 || true
+
       - name: terraform apply
         run: |
-          terraform -chdir="${WORKDIR}" apply -input=false -auto-approve -lock-timeout=5m \
+          terraform -chdir="${WORKDIR}" apply -input=false -auto-approve -lock=false \
             -var="owner=${{ vars.OWNER || 'mohan' }}" \
             -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
             -var="aws_region=${AWS_REGION}"
