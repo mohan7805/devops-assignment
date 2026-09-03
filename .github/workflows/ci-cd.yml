@@ -113,7 +113,7 @@ jobs:
       # The results are also uploaded, but the gate is what stops the pipeline.
       - name: Scan image with Trivy (fails on HIGH/CRITICAL)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_trivy_scan != false }}
-        uses: aquasecurity/trivy-action@v0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.PROJECT }}:${{ steps.meta.outputs.short_sha }}
           format: table
@@ -126,7 +126,7 @@ jobs:
 
       - name: Trivy SARIF report
         if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.run_trivy_scan != false) }}
-        uses: aquasecurity/trivy-action@v0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.PROJECT }}:${{ steps.meta.outputs.short_sha }}
           format: sarif
