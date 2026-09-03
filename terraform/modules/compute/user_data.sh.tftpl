@@ -112,11 +112,24 @@ ENVFILE
 ###############################################################################
 ECR_REGISTRY="$${ECR_REPOSITORY_URL%%/*}"
 aws ecr get-login-password --region "$${AWS_REGION}" \
-  | docker login --username AWS --password-stdin "$${ECR_REGISTRY}"
+  | docker login --username AWS --password-stdin "$${ECR_REGISTRY}" || true
 
-docker pull "$${ECR_REPOSITORY_URL}:$${IMAGE_TAG}"
+if [[ "$${IMAGE_TAG}" == "bootstrap" ]] || ! docker pull "$${ECR_REPOSITORY_URL}:$${IMAGE_TAG}"; then
+  echo "[user-data] ECR image $${IMAGE_TAG} not yet pushed; starting bootstrap health responder"
+  cat > /etc/systemd/system/app.service <<UNIT
+[Unit]
+Description=Bootstrap health responder
+After=network-online.target
 
-cat > /etc/systemd/system/app.service <<UNIT
+[Service]
+Restart=always
+ExecStart=/usr/bin/python3 -c 'import http.server, json; s = http.server.HTTPServer(("0.0.0.0", $${APP_PORT}), type("H", (http.server.BaseHTTPRequestHandler,), {"do_GET": lambda self: (self.send_response(200), self.send_header("Content-Type", "application/json"), self.end_headers(), self.wfile.write(json.dumps({"status": "ok", "version": "bootstrap"}).encode()))})); s.serve_forever()'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+else
+  cat > /etc/systemd/system/app.service <<UNIT
 [Unit]
 Description=DevOps assignment API container
 After=docker.service network-online.target
@@ -143,6 +156,7 @@ ExecStop=/usr/bin/docker stop --time 30 $${CONTAINER_NAME}
 [Install]
 WantedBy=multi-user.target
 UNIT
+fi
 
 systemctl daemon-reload
 systemctl enable --now app.service

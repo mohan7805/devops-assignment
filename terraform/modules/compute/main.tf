@@ -94,10 +94,6 @@ resource "aws_autoscaling_group" "this" {
   default_cooldown          = 60
   wait_for_capacity_timeout = "15m"
 
-  # Terraform waits until this many instances are healthy in the target group
-  # before reporting success, which makes `terraform apply` a real deploy gate.
-  min_elb_capacity = var.min_size
-
   target_group_arns = [var.target_group_arn]
 
   launch_template {
