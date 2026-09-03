@@ -1,13 +1,12 @@
 name: CI/CD
 
-# Runs automatically on every push to main. Pull requests get everything except
-# the push/deploy stages.
+# Runs automatically on pull requests and manual triggers (push trigger disabled).
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
+  # push:
+  #   branches: [main]
+  #   paths-ignore:
+  #     - 'docs/**'
+  #     - '**/*.md'
   pull_request:
     branches: [main]
   workflow_dispatch:

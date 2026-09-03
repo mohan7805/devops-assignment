@@ -1,12 +1,12 @@
 name: Terraform
 
-# Infrastructure pipeline: validate + plan on pull requests, apply on main.
+# Infrastructure pipeline: validate + plan on pull requests, manual dispatch for apply.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'terraform/**'
-      - '.github/workflows/terraform.yml'
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - 'terraform/**'
+  #     - '.github/workflows/terraform.yml'
   pull_request:
     branches: [main]
     paths:
