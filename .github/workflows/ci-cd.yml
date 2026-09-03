@@ -173,9 +173,13 @@ jobs:
           set -euo pipefail
           IMAGE_URI="${{ steps.ecr.outputs.registry }}/${PROJECT}:${{ steps.meta.outputs.short_sha }}"
           docker tag "${PROJECT}:${{ steps.meta.outputs.short_sha }}" "${IMAGE_URI}"
-          docker push "${IMAGE_URI}"
+          if aws ecr describe-images --repository-name "${PROJECT}" --image-ids imageTag="${{ steps.meta.outputs.short_sha }}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+            echo "Image tag ${{ steps.meta.outputs.short_sha }} already exists in ECR. Skipping push to respect immutability."
+          else
+            docker push "${IMAGE_URI}"
+            echo "Pushed image tagged ${{ steps.meta.outputs.short_sha }}"
+          fi
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-          echo "Pushed image tagged ${{ steps.meta.outputs.short_sha }}"
 
   # ===========================================================================
   # 5. DEPLOY - rolling instance refresh, gated on ALB target health.
