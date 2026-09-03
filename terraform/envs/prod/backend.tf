@@ -15,7 +15,10 @@
 
 terraform {
   backend "s3" {
-    key     = "prod/terraform.tfstate"
-    encrypt = true
+    bucket         = "devops-mohan"
+    key            = "prod/terraform.tfstate"
+    region         = "ap-south-1"
+    dynamodb_table = "devops-assignment-tf-locks"
+    encrypt        = true
   }
 }

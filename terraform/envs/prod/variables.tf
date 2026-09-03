@@ -13,6 +13,7 @@ variable "project" {
 variable "owner" {
   description = "Owner tag value (team or individual responsible for the stack)."
   type        = string
+  default     = "mohan"
 }
 
 variable "environment" {
@@ -90,6 +91,7 @@ variable "log_retention_days" {
 variable "alarm_email" {
   description = "Email address subscribed to the SNS alarm topic."
   type        = string
+  default     = "mohanmadhavan7805@gmail.com"
 }
 
 variable "alb_ingress_cidrs" {

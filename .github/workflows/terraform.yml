@@ -90,16 +90,16 @@ jobs:
       - name: terraform init (S3 backend + DynamoDB lock)
         run: |
           terraform -chdir="${WORKDIR}" init -input=false \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET || 'devops-mohan' }}" \
             -backend-config="key=prod/terraform.tfstate" \
             -backend-config="region=${AWS_REGION}" \
-            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE || 'devops-assignment-tf-locks' }}"
 
       - name: terraform plan
         run: |
           terraform -chdir="${WORKDIR}" plan -input=false -lock-timeout=5m -out=tfplan \
-            -var="owner=${{ vars.OWNER || 'platform-team' }}" \
-            -var="alarm_email=${{ secrets.ALARM_EMAIL }}" \
+            -var="owner=${{ vars.OWNER || 'mohan' }}" \
+            -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
             -var="aws_region=${AWS_REGION}"
 
       - name: Render the plan
@@ -137,16 +137,16 @@ jobs:
       - name: terraform init
         run: |
           terraform -chdir="${WORKDIR}" init -input=false \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET || 'devops-mohan' }}" \
             -backend-config="key=prod/terraform.tfstate" \
             -backend-config="region=${AWS_REGION}" \
-            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE || 'devops-assignment-tf-locks' }}"
 
       - name: terraform apply
         run: |
           terraform -chdir="${WORKDIR}" apply -input=false -auto-approve -lock-timeout=5m \
-            -var="owner=${{ vars.OWNER || 'platform-team' }}" \
-            -var="alarm_email=${{ secrets.ALARM_EMAIL }}" \
+            -var="owner=${{ vars.OWNER || 'mohan' }}" \
+            -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
             -var="aws_region=${AWS_REGION}"
 
       - name: Publish the stack outputs
