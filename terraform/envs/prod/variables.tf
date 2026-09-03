@@ -49,19 +49,19 @@ variable "instance_type" {
 variable "min_size" {
   description = "Minimum ASG size."
   type        = number
-  default     = 2
+  default     = 1
 }
 
 variable "max_size" {
   description = "Maximum ASG size."
   type        = number
-  default     = 4
+  default     = 2
 }
 
 variable "desired_capacity" {
   description = "Desired ASG size."
   type        = number
-  default     = 2
+  default     = 1
 }
 
 variable "app_port" {
