@@ -79,7 +79,19 @@ resource "aws_launch_template" "this" {
   }
 }
 
+# The Auto Scaling service needs a service-linked role to validate ALB/TG
+# configuration. In fresh accounts this role may not exist yet.
+resource "aws_iam_service_linked_role" "autoscaling" {
+  aws_service_name = "autoscaling.amazonaws.com"
+
+  # If the role already exists, Terraform will import it on the next apply.
+  lifecycle {
+    ignore_changes = [description]
+  }
+}
+
 resource "aws_autoscaling_group" "this" {
+  depends_on = [aws_iam_service_linked_role.autoscaling]
   name_prefix         = "${var.name}-asg-"
   vpc_zone_identifier = var.private_subnet_ids
 
