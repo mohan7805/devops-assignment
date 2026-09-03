@@ -80,7 +80,6 @@ resource "aws_launch_template" "this" {
 }
 
 resource "aws_autoscaling_group" "this" {
-  depends_on = [aws_iam_service_linked_role.autoscaling]
   name_prefix         = "${var.name}-asg-"
   vpc_zone_identifier = var.private_subnet_ids
 
