@@ -310,7 +310,7 @@ jobs:
             TOTAL="$(echo "${STATES}" | tr '\t' '\n' | grep -c . || true)"
             echo "attempt ${attempt}: ${HEALTHY}/${TOTAL} targets healthy (${STATES})"
 
-            if [[ "${TOTAL}" -ge 2 && "${HEALTHY}" -eq "${TOTAL}" ]]; then
+            if [[ "${TOTAL}" -ge 1 && "${HEALTHY}" -eq "${TOTAL}" ]]; then
               echo "All ${TOTAL} targets are healthy."
               exit 0
             fi

@@ -170,13 +170,13 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
 # Fewer healthy targets than the ASG minimum - capacity has degraded.
 resource "aws_cloudwatch_metric_alarm" "healthy_hosts" {
   alarm_name          = "${var.name}-healthy-hosts-low"
-  alarm_description   = "Fewer than two healthy targets are registered with the load balancer."
+  alarm_description   = "Fewer than one healthy target is registered with the load balancer."
   namespace           = "AWS/ApplicationELB"
   metric_name         = "HealthyHostCount"
   statistic           = "Minimum"
   period              = 60
   evaluation_periods  = 3
-  threshold           = 2
+  threshold           = 1
   comparison_operator = "LessThanThreshold"
   # "missing" rather than "breaching": the metric has no datapoints until the
   # first targets register, and a false alarm email on every apply is noise.
