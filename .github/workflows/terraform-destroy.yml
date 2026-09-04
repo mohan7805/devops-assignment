@@ -67,9 +67,10 @@ jobs:
             -backend-config="region=${AWS_REGION}" \
             -backend-config="dynamodb_table=${{ steps.bootstrap.outputs.table }}"
 
-      - name: Release stale lock if present
+      - name: Release DynamoDB lock if present
+        continue-on-error: true
         run: |
-          terraform -chdir="${WORKDIR}" force-unlock -force 46b5894a-f9e1-f85c-daa2-4efbcc1486a8 || true
+          aws dynamodb delete-item --table-name "${{ steps.bootstrap.outputs.table }}" --key "{\"LockID\": {\"S\": \"${{ steps.bootstrap.outputs.bucket }}/prod/terraform.tfstate-md5\"}}" 2>/dev/null || true
 
       - name: Empty ECR images to prevent dependency errors
         run: |
