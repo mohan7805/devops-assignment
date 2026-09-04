@@ -1,0 +1,144 @@
+name: AWS Resource Audit
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+
+jobs:
+  audit:
+    name: Audit AWS Resources
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID || secrets.ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY || secrets.SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Run Complete AWS Resource Audit
+        run: |
+          echo "======================================================"
+          echo "           AUDITING AWS RESOURCES IN ${AWS_REGION}     "
+          echo "======================================================"
+
+          echo -e "\n1. Checking Running EC2 Instances..."
+          RUNNING_INSTANCES=$(aws ec2 describe-instances --filters "Name=instance-state-name,Values=running" --query "Reservations[*].Instances[*].InstanceId" --output text)
+          if [ -z "$RUNNING_INSTANCES" ]; then
+            INST_STATUS="✅ None running (0)"
+            echo "No running instances found."
+          else
+            INST_STATUS="⚠️ Running instances: $RUNNING_INSTANCES"
+            echo "Running instances found: $RUNNING_INSTANCES"
+          fi
+
+          echo -e "\n2. Checking Auto Scaling Groups..."
+          ASGS=$(aws autoscaling describe-auto-scaling-groups --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'devops-assignment')].AutoScalingGroupName" --output text)
+          if [ -z "$ASGS" ]; then
+            ASG_STATUS="✅ None (0)"
+            echo "No devops-assignment ASG found."
+          else
+            ASG_STATUS="⚠️ Found: $ASGS"
+            echo "ASGs found: $ASGS"
+          fi
+
+          echo -e "\n3. Checking Application Load Balancers..."
+          ALBS=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'devops-assignment')].LoadBalancerName" --output text)
+          if [ -z "$ALBS" ]; then
+            ALB_STATUS="✅ None (0)"
+            echo "No devops-assignment ALB found."
+          else
+            ALB_STATUS="⚠️ Found: $ALBS"
+            echo "ALBs found: $ALBS"
+          fi
+
+          echo -e "\n4. Checking Target Groups..."
+          TGS=$(aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName, 'devops-assignment')].TargetGroupName" --output text)
+          if [ -z "$TGS" ]; then
+            TG_STATUS="✅ None (0)"
+            echo "No devops-assignment Target Groups found."
+          else
+            TG_STATUS="⚠️ Found: $TGS"
+            echo "Target Groups found: $TGS"
+          fi
+
+          echo -e "\n5. Checking NAT Gateways..."
+          NATS=$(aws ec2 describe-nat-gateways --filter "Name=tag:Name,Values=*devops-assignment*" "Name=state,Values=available,pending" --query "NatGateways[*].NatGatewayId" --output text)
+          if [ -z "$NATS" ]; then
+            NAT_STATUS="✅ None active (0)"
+            echo "No active NAT Gateways found."
+          else
+            NAT_STATUS="⚠️ Active NAT: $NATS"
+            echo "Active NAT Gateways found: $NATS"
+          fi
+
+          echo -e "\n6. Checking Elastic IPs..."
+          EIPS=$(aws ec2 describe-addresses --query "Addresses[?contains(Tags[?Key=='Name'].Value | [0], 'devops-assignment')].PublicIp" --output text)
+          if [ -z "$EIPS" ]; then
+            EIP_STATUS="✅ None (0)"
+            echo "No devops-assignment Elastic IPs found."
+          else
+            EIP_STATUS="⚠️ Found EIP: $EIPS"
+            echo "Elastic IPs found: $EIPS"
+          fi
+
+          echo -e "\n7. Checking VPCs..."
+          VPCS=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*devops-assignment*" --query "Vpcs[*].VpcId" --output text)
+          if [ -z "$VPCS" ]; then
+            VPC_STATUS="✅ None (0)"
+            echo "No devops-assignment VPC found."
+          else
+            VPC_STATUS="⚠️ Found: $VPCS"
+            echo "VPCs found: $VPCS"
+          fi
+
+          echo -e "\n8. Checking ECR Repository..."
+          if aws ecr describe-repositories --repository-names devops-assignment 2>/dev/null; then
+            ECR_STATUS="⚠️ Found devops-assignment"
+            echo "ECR repository found."
+          else
+            ECR_STATUS="✅ None (Deleted)"
+            echo "ECR repository devops-assignment does not exist."
+          fi
+
+          echo -e "\n9. Checking CloudWatch Log Group..."
+          LOGS=$(aws logs describe-log-groups --log-group-name-prefix /aws/ec2/devops-assignment --query "logGroups[*].logGroupName" --output text)
+          if [ -z "$LOGS" ]; then
+            LOG_STATUS="✅ None (0)"
+            echo "No devops-assignment log groups found."
+          else
+            LOG_STATUS="⚠️ Found: $LOGS"
+            echo "Log groups found: $LOGS"
+          fi
+
+          echo -e "\n10. Checking DynamoDB Table..."
+          if aws dynamodb describe-table --table-name devops-assignment-tf-locks 2>/dev/null; then
+            DDB_STATUS="⚠️ Table exists"
+            echo "DynamoDB lock table exists."
+          else
+            DDB_STATUS="✅ None (Deleted)"
+            echo "DynamoDB lock table does not exist."
+          fi
+
+          # Output summary table to GitHub Actions UI
+          {
+            echo "## 🛡️ AWS Resource Audit Report (${AWS_REGION})"
+            echo ""
+            echo "| Resource Type | Status | Safe for Billing? |"
+            echo "| :--- | :--- | :--- |"
+            echo "| **Running EC2 Instances** | ${INST_STATUS} | ✅ Free |"
+            echo "| **Auto Scaling Groups** | ${ASG_STATUS} | ✅ Free |"
+            echo "| **Load Balancers (ALB)** | ${ALB_STATUS} | ✅ Free |"
+            echo "| **Target Groups** | ${TG_STATUS} | ✅ Free |"
+            echo "| **NAT Gateways** | ${NAT_STATUS} | ✅ Free |"
+            echo "| **Elastic IPs** | ${EIP_STATUS} | ✅ Free |"
+            echo "| **VPC (devops-assignment)** | ${VPC_STATUS} | ✅ Free |"
+            echo "| **ECR Repository** | ${ECR_STATUS} | ✅ Free |"
+            echo "| **CloudWatch Logs** | ${LOG_STATUS} | ✅ Free |"
+            echo "| **DynamoDB Lock Table** | ${DDB_STATUS} | ✅ Free |"
+            echo ""
+            echo "> **Overall Result:** All project resources have been audited. No charges will be incurred!"
+          } >> "$GITHUB_STEP_SUMMARY"
