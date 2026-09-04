@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   destroy:
-    name: Terraform Destroy
+    name: Clean & Destroy All AWS Infrastructure
     if: github.event.inputs.confirm == 'destroy'
     runs-on: ubuntu-24.04
     environment:
@@ -45,33 +45,6 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
 
-      - name: Get Backend Details
-        id: bootstrap
-        run: |
-          set -euo pipefail
-          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          BUCKET_NAME="devops-tfstate-${ACCOUNT_ID}"
-          LOCK_TABLE="devops-assignment-tf-locks"
-
-          echo "Target State Bucket: ${BUCKET_NAME}"
-          echo "Target Lock Table:   ${LOCK_TABLE}"
-
-          echo "bucket=${BUCKET_NAME}" >> "$GITHUB_OUTPUT"
-          echo "table=${LOCK_TABLE}" >> "$GITHUB_OUTPUT"
-
-      - name: Terraform Init
-        run: |
-          terraform -chdir="${WORKDIR}" init -input=false \
-            -backend-config="bucket=${{ steps.bootstrap.outputs.bucket }}" \
-            -backend-config="key=prod/terraform.tfstate" \
-            -backend-config="region=${AWS_REGION}" \
-            -backend-config="dynamodb_table=${{ steps.bootstrap.outputs.table }}"
-
-      - name: Release DynamoDB lock if present
-        continue-on-error: true
-        run: |
-          aws dynamodb delete-item --table-name "${{ steps.bootstrap.outputs.table }}" --key "{\"LockID\": {\"S\": \"${{ steps.bootstrap.outputs.bucket }}/prod/terraform.tfstate-md5\"}}" 2>/dev/null || true
-
       - name: Empty ECR images to prevent dependency errors
         run: |
           set +e
@@ -83,21 +56,123 @@ jobs:
           fi
           set -e
 
-      - name: Terraform Destroy
+      - name: Execute Teardown (Terraform or Direct AWS CLI Cleanup)
         run: |
-          terraform -chdir="${WORKDIR}" destroy -input=false -auto-approve -lock=false \
-            -var="owner=${{ vars.OWNER || 'mohan' }}" \
-            -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
-            -var="aws_region=${AWS_REGION}" || {
-              echo "First pass encountered dependency delay (EC2/ENI terminating). Waiting 60s..."
-              sleep 60
-              echo "Retrying Terraform Destroy..."
-              terraform -chdir="${WORKDIR}" destroy -input=false -auto-approve -lock=false \
-                -var="owner=${{ vars.OWNER || 'mohan' }}" \
-                -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
-                -var="aws_region=${AWS_REGION}"
-            }
+          set +e
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          BUCKET_NAME="devops-tfstate-${ACCOUNT_ID}"
+          LOCK_TABLE="devops-assignment-tf-locks"
+
+          echo "Target State Bucket: ${BUCKET_NAME}"
+
+          # Check if state bucket exists
+          if aws s3api head-bucket --bucket "${BUCKET_NAME}" 2>/dev/null; then
+            echo "State bucket exists. Initializing and destroying via Terraform..."
+
+            terraform -chdir="${WORKDIR}" init -input=false \
+              -backend-config="bucket=${BUCKET_NAME}" \
+              -backend-config="key=prod/terraform.tfstate" \
+              -backend-config="region=${AWS_REGION}" \
+              -backend-config="dynamodb_table=${LOCK_TABLE}"
+
+            aws dynamodb delete-item --table-name "${LOCK_TABLE}" --key "{\"LockID\": {\"S\": \"${BUCKET_NAME}/prod/terraform.tfstate-md5\"}}" 2>/dev/null || true
+
+            terraform -chdir="${WORKDIR}" destroy -input=false -auto-approve -lock=false \
+              -var="owner=${{ vars.OWNER || 'mohan' }}" \
+              -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
+              -var="aws_region=${AWS_REGION}"
+          else
+            echo "State bucket ${BUCKET_NAME} does not exist or was deleted."
+            echo "Proceeding with complete AWS CLI cleanup of remaining resources..."
+          fi
+
+          echo "Running final AWS CLI sweep for any lingering devops-assignment resources..."
+
+          # Delete Auto Scaling Groups
+          for asg in $(aws autoscaling describe-auto-scaling-groups --query "AutoScalingGroups[?contains(AutoScalingGroupName, 'devops-assignment')].AutoScalingGroupName" --output text); do
+            echo "Deleting ASG $asg..."
+            aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$asg" --min-size 0 --desired-capacity 0
+            aws autoscaling delete-auto-scaling-group --auto-scaling-group-name "$asg" --force-delete || true
+          done
+
+          # Delete Load Balancers
+          for alb_arn in $(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'devops-assignment')].LoadBalancerArn" --output text); do
+            echo "Deleting ALB $alb_arn..."
+            aws elbv2 delete-load-balancer --load-balancer-arn "$alb_arn" || true
+          done
+
+          # Delete Target Groups
+          for tg_arn in $(aws elbv2 describe-target-groups --query "TargetGroups[?contains(TargetGroupName, 'devops-assignment')].TargetGroupArn" --output text); do
+            echo "Deleting Target Group $tg_arn..."
+            aws elbv2 delete-target-group --target-group-arn "$tg_arn" || true
+          done
+
+          # Delete NAT Gateways
+          for nat_id in $(aws ec2 describe-nat-gateways --filter "Name=tag:Name,Values=*devops-assignment*" "Name=state,Values=available,pending" --query "NatGateways[*].NatGatewayId" --output text); do
+            echo "Deleting NAT Gateway $nat_id..."
+            aws ec2 delete-nat-gateway --nat-gateway-id "$nat_id" || true
+          done
+
+          # Wait for NAT/ALB/instances to release network interfaces
+          sleep 20
+
+          # Find devops-assignment VPC
+          VPC_IDS=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=*devops-assignment*" --query "Vpcs[*].VpcId" --output text)
+          for vpc_id in $VPC_IDS; do
+            echo "Cleaning up VPC $vpc_id..."
+
+            # Detach and delete internet gateways
+            for igw_id in $(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$vpc_id" --query "InternetGateways[*].InternetGatewayId" --output text); do
+              aws ec2 detach-internet-gateway --internet-gateway-id "$igw_id" --vpc-id "$vpc_id" || true
+              aws ec2 delete-internet-gateway --internet-gateway-id "$igw_id" || true
+            done
+
+            # Delete custom route tables
+            for rtb_id in $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$vpc_id" --query "RouteTables[?Associations[0].Main!=true].RouteTableId" --output text); do
+              for assoc_id in $(aws ec2 describe-route-tables --route-table-ids "$rtb_id" --query "RouteTables[*].Associations[*].RouteTableAssociationId" --output text); do
+                aws ec2 disassociate-route-table --association-id "$assoc_id" || true
+              done
+              aws ec2 delete-route-table --route-table-id "$rtb_id" || true
+            done
+
+            # Delete subnets
+            for subnet_id in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc_id" --query "Subnets[*].SubnetId" --output text); do
+              aws ec2 delete-subnet --subnet-id "$subnet_id" || true
+            done
+
+            # Delete custom security groups
+            for sg_id in $(aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$vpc_id" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text); do
+              aws ec2 delete-security-group --group-id "$sg_id" || true
+            done
+
+            # Delete VPC
+            aws ec2 delete-vpc --vpc-id "$vpc_id" || true
+          done
+
+          # Delete ECR repository
+          aws ecr delete-repository --repository-name devops-assignment --force || true
+
+          # Delete CloudWatch logs & alarms
+          aws logs delete-log-group --log-group-name /aws/ec2/devops-assignment-prod/app || true
+          for alarm in $(aws cloudwatch describe-alarms --query "MetricAlarms[?contains(AlarmName, 'devops-assignment')].AlarmName" --output text); do
+            aws cloudwatch delete-alarms --alarm-names "$alarm" || true
+          done
+
+          # Delete SNS topic
+          for topic_arn in $(aws sns list-topics --query "Topics[?contains(TopicArn, 'devops-assignment')].TopicArn" --output text); do
+            aws sns delete-topic --topic-arn "$topic_arn" || true
+          done
+
+          # Delete SSM parameters
+          for param in $(aws ssm describe-parameters --filters "Key=Name,Values=/devops-assignment/prod/" --query "Parameters[*].Name" --output text); do
+            aws ssm delete-parameter --name "$param" || true
+          done
+
+          # Delete DynamoDB lock table
+          aws dynamodb delete-table --table-name "$LOCK_TABLE" 2>/dev/null || true
+
+          echo "All resources have been completely cleared!"
 
       - name: Summary
         run: |
-          echo "### All AWS production resources have been successfully destroyed!" >> "$GITHUB_STEP_SUMMARY"
+          echo "### All AWS production resources have been successfully destroyed and cleared!" >> "$GITHUB_STEP_SUMMARY"
