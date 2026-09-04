@@ -87,7 +87,15 @@ jobs:
           terraform -chdir="${WORKDIR}" destroy -input=false -auto-approve -lock=false \
             -var="owner=${{ vars.OWNER || 'mohan' }}" \
             -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
-            -var="aws_region=${AWS_REGION}"
+            -var="aws_region=${AWS_REGION}" || {
+              echo "First pass encountered dependency delay (EC2/ENI terminating). Waiting 60s..."
+              sleep 60
+              echo "Retrying Terraform Destroy..."
+              terraform -chdir="${WORKDIR}" destroy -input=false -auto-approve -lock=false \
+                -var="owner=${{ vars.OWNER || 'mohan' }}" \
+                -var="alarm_email=${{ secrets.ALARM_EMAIL || 'mohanmadhavan7805@gmail.com' }}" \
+                -var="aws_region=${AWS_REGION}"
+            }
 
       - name: Summary
         run: |
