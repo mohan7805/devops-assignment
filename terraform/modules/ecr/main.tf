@@ -9,7 +9,7 @@
 resource "aws_ecr_repository" "this" {
   name                 = var.name
   image_tag_mutability = var.image_tag_mutability
-  force_delete         = false
+  force_delete         = true
 
   # Second line of defence behind the Trivy gate in CI.
   image_scanning_configuration {
